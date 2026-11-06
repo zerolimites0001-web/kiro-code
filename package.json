@@ -1,0 +1,10 @@
+{
+  "name": "kiro-code",
+  "version": "0.2.0",
+  "description": "Kiro Code: CLI de agente de código leve, pure JS, com TUI colorida",
+  "type": "module",
+  "bin": { "kiro": "bin/kiro.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node bin/kiro.js" },
+  "license": "MIT"
+}

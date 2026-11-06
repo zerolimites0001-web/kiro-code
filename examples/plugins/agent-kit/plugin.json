@@ -1,0 +1,10 @@
+{
+  "name": "agent-kit",
+  "version": "0.1.0",
+  "description": "Planejamento e memória: /plan grava um plano e outro módulo do mesmo plugin o registra",
+  "main": "main.js",
+  "permissions": ["fs"],
+  "config": {
+    "maxPlans": 20
+  }
+}
