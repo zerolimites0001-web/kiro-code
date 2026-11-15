@@ -1,212 +1,256 @@
-# Plano de plugins do Kiro Code
+# Guia de plugins
 
-## 1. Objetivo
+[← README](README.md) · [Configuração](docs/CONFIGURATION.md) · [Segurança](SECURITY.md)
 
-Permitir estender o Kiro sem mexer no código-fonte. Um plugin pode:
+Plugins são módulos JavaScript locais que estendem a TUI e as ferramentas do agente.
+Este guia descreve o loader implementado em `src/plugins.js`, não um plano futuro.
 
-- registrar ferramentas para o agente (`bash`, `read_file`, ...)
-- registrar comandos slash (`/timer`, `/deploy`, ...)
-- mostrar **widgets ao vivo** na TUI (ex: um timer rodando)
-- reagir a eventos do agente (início/fim de turno, antes/depois de cada ferramenta)
-- conversar com outros plugins por eventos
+> Plugins executam código Node.js com os privilégios do usuário. A aprovação por
+> hash e o campo `permissions` não fornecem sandbox. Revise o código antes de aprovar.
 
-Plugins ficam em `~/.kiro/plugins/` e são carregados na inicialização.
+## Instalar o exemplo do cronômetro
 
-## 2. Formas de plugin
+A pasta efetiva de plugins é `<HOME da instância>/plugins/`. No modo compartilhado,
+isso corresponde a `~/.kiro/plugins/`.
 
-### 2.1 Arquivo único
+Para um teste previsível, copie o exemplo e execute explicitamente nesse modo:
 
-```
-~/.kiro/plugins/timer.js
-```
-
-Um arquivo ES module com export default. Ideal para coisas pequenas.
-
-### 2.2 Pasta com manifesto
-
-```
-~/.kiro/plugins/agent-kit/
-├── plugin.json        manifesto (obrigatório)
-├── main.js            arquivo de início (indicado em "main")
-├── lib/
-│   ├── planner.js     módulos internos, importados com ./lib/...
-│   └── memory.js
-└── assets/            opcional
+```sh
+# Na pasta clonada do kiro-code:
+mkdir -p ~/.kiro/plugins
+# Necessário para tratar .js como ESM nas versões de Node que exigem esse marcador.
+# Se este arquivo já existir, preserve seu conteúdo e confira "type": "module".
+test -f ~/.kiro/plugins/package.json || printf '{"type":"module"}\n' > ~/.kiro/plugins/package.json
+cp examples/plugins/timer.js ~/.kiro/plugins/timer.js
+KIRO_NO_ISOLATE=1 node bin/kiro.js
 ```
 
-`plugin.json`:
+Dentro do Kiro:
 
-```json
-{
-  "name": "agent-kit",
-  "version": "0.1.0",
-  "description": "Kit de planejamento e memória para o agente",
-  "main": "main.js",
-  "permissions": ["shell", "fs"],
-  "config": {
-    "maxSteps": 10
-  }
-}
+```text
+/plugins
+/plugins approve timer
+/timer
+/timer stop
 ```
 
-- `main` é o arquivo de entrada. Os demais arquivos são importados livremente pelo `main.js` (ESM nativo, sem bundler).
-- `permissions` é informativo nesta versão: o Kiro mostra no `/plugins` o que cada plugin declara.
-- `config` são valores padrão que o usuário pode sobrescrever em `~/.kiro/plugins.json`.
-- Plugins de pasta podem se conectar entre si via o barramento de eventos (seção 5).
+`/plugins approve` pode executar o plugin imediatamente. Não aprove sem revisar.
+Para instalar um arquivo novo com o Kiro já aberto, rode `/plugins reload` antes
+de aprová-lo, para que a descoberta seja refeita.
 
-## 3. Contrato do plugin
+### Com isolamento por instância
 
-Todo plugin exporta um objeto com `setup(kiro)`:
+`KIRO_INSTANCE=trabalho` usa uma pasta estável em `~/.kiro/instances/trabalho/`.
+A descoberta lê o `plugins/` desse diretório lógico, não necessariamente o global.
+
+Na criação de uma instância, o código tenta criar um symlink para a pasta global
+**se ela já existir** e a pasta local ainda não existir. Uma pasta local já criada
+não é substituída automaticamente. `/instances` ajuda a identificar o diretório.
+
+Aprovação, configuração e dados também pertencem ao HOME lógico. Se mudar de
+instância, não presuma que o estado do plugin foi sincronizado. Veja
+[configuração e diretórios](docs/CONFIGURATION.md).
+
+## Formatos
+
+### Arquivo único
+
+```text
+plugins/
+├── package.json       {"type":"module"}, quando necessário para ESM
+└── hello.js
+```
 
 ```js
 export default {
-  name: 'timer',
+  name: 'hello',
   version: '0.1.0',
+  description: 'Meu primeiro plugin',
   setup(kiro) {
-    kiro.command('/timer', {
-      description: 'Inicia um timer e mostra na TUI',
-      async run(args) { /* ... */ },
-    });
-  },
-  teardown() { /* opcional: limpar intervalos, fechar conexões */ },
-};
-```
-
-`setup` pode ser assíncrono. `teardown` é chamado ao recarregar ou desativar o plugin.
-
-## 4. API `kiro` entregue ao plugin
-
-| Método | Para que serve |
-|---|---|
-| `kiro.tool({ schema, run })` | Registra uma ferramenta que o modelo pode chamar. Mesmo formato das ferramentas internas. |
-| `kiro.command(name, { description, run })` | Registra um comando `/nome`. `run(args, ctx)` recebe o texto depois do comando. |
-| `kiro.widget(id, { render, interval })` | Cria uma área ao vivo na TUI (ver seção 6). `render()` devolve linhas; o Kiro redesenha a cada `interval` ms. |
-| `kiro.print(texto, cor?)` | Escreve no histórico, como as mensagens do sistema. |
-| `kiro.on(evento, fn)` | Assina um evento do agente (seção 5). |
-| `kiro.emit(evento, dados)` | Publica um evento para outros plugins. |
-| `kiro.config` | Configuração efetiva (padrões do `plugin.json` + ajustes do usuário). |
-| `kiro.dataDir` | Pasta própria do plugin para guardar dados: `~/.kiro/plugin-data/<name>/`. |
-| `kiro.log(msg)` | Grava em `~/.kiro/debug.log`, marcado com o nome do plugin. |
-
-Nada de API de rede ou shell é exposto por padrão. Quem precisa de shell usa `child_process` diretamente, e isso fica registrado como permissão declarada.
-
-## 5. Eventos
-
-Eventos previstos:
-
-| Evento | Quando | Dados |
-|---|---|---|
-| `turn:start` | Usuário envia mensagem | `{ text }` |
-| `turn:end` | Agente termina o turno | `{ seconds, usage }` |
-| `tool:before` | Antes de executar uma ferramenta | `{ name, args }` |
-| `tool:after` | Depois | `{ name, status, result }` |
-| `session:change` | Trocou de sessão (`/new`, `/resume`) | `{ id }` |
-| `plugin:*` | Eventos próprios de plugins | livre |
-
-Conexão entre plugins: o `agent-kit` emite `plugin:agent-kit:plan`, e outro plugin que quiser ouvir faz `kiro.on('plugin:agent-kit:plan', fn)`. Nada é acoplado por import.
-
-## 6. Widgets ao vivo (o timer)
-
-A TUI ganha uma **faixa de widgets** entre o histórico e a linha separadora. Cada widget ocupa de 1 a N linhas e é redesenhado no intervalo declarado.
-
-Exemplo do `timer.js`:
-
-```js
-let start = null;
-let interval = null;
-
-export default {
-  name: 'timer',
-  version: '0.1.0',
-  setup(kiro) {
-    const fmt = (ms) => {
-      const s = Math.floor(ms / 1000);
-      return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-    };
-
-    kiro.widget('timer', {
-      interval: 1000,
-      render: () => (start ? [`⏱  ${fmt(Date.now() - start)}   (/timer stop para parar)`] : []),
-    });
-
-    kiro.command('/timer', {
-      description: 'Inicia ou para um cronômetro na TUI',
+    kiro.command('/hello', {
+      description: 'Mostra uma mensagem',
       run(args) {
-        if (args.trim() === 'stop') {
-          start = null;
-          return kiro.print('Timer parado.');
-        }
-        start = Date.now();
-        kiro.print('Timer iniciado.');
+        return `Olá, ${args.trim() || 'mundo'}!`;
       },
     });
   },
 };
 ```
 
-Regras da faixa de widgets:
+Em plugins de arquivo único, o nome usado pelo loader vem do **nome do arquivo**
+(`hello.js` → `hello`). Não dependa de `default.name` para mudar o namespace.
 
-- Só widgets com conteúdo (`render()` com linhas) ocupam espaço. Sem conteúdo, a área some.
-- Limite de 6 linhas no total. Acima disso o Kiro corta e mostra `… +N`.
-- O redesenho do widget é só da faixa, não do histórico, para não piscar.
-- Um widget que lança erro é desativado e aparece no `/plugins` como `erro`.
+### Pasta com manifesto
 
-## 7. Carregamento e ciclo de vida
+```text
+agent-kit/
+├── plugin.json
+├── main.js
+└── lib/
+    ├── planner.js
+    └── memory.js
+```
 
-Na inicialização:
+```json
+{
+  "name": "agent-kit",
+  "version": "0.1.0",
+  "description": "Planejamento e memória local",
+  "main": "main.js",
+  "permissions": ["fs"],
+  "config": {"maxPlans": 20}
+}
+```
 
-1. Lê `~/.kiro/plugins.json` (lista de desativados e sobrescrita de config).
-2. Varre `~/.kiro/plugins/`:
-   - `*.js` → plugin de arquivo único
-   - pasta com `plugin.json` → lê `main` e importa
-   - pasta sem `plugin.json` → ignorada, com aviso no `/plugins`
-3. Importa cada um com `import()` dentro de `try/catch`. Um plugin quebrado não derruba os outros.
-4. Chama `setup(kiro)`.
+`plugin.json` é o manifesto do loader, **não** um `package.json` do Node. Para
+importar `.js` como ESM, mantenha `"type":"module"` em um `package.json` aplicável
+à pasta do plugin. Imports relativos de submódulos usam o ESM nativo.
 
-Comandos:
+`permissions` é apenas uma declaração exibida na listagem. O loader não limita
+imports de `node:fs`, `node:child_process` ou acesso à rede.
 
-| Comando | Faz |
-|---|---|
-| `/plugins` | Lista: nome, versão, status (ativo, desativado, erro), comandos, widgets, permissões |
-| `/plugins reload` | Chama `teardown` de todos, reimporta com `?v=timestamp` e chama `setup` de novo |
-| `/plugins off <nome>` | Desativa e grava em `plugins.json` |
-| `/plugins on <nome>` | Reativa |
+Exemplo incluído: [`examples/plugins/agent-kit`](examples/plugins/agent-kit/).
+O `/plan` desse exemplo cria um registro de plano e o publica em um evento; não
+é um planejador autônomo de IA. A ferramenta `listar_planos` do exemplo retorna
+uma mensagem de limite configurado, não uma consulta completa dos registros.
 
-Ao recarregar, os comandos e ferramentas de plugin são removidos antes e registrados de novo, para não duplicar.
+## Contrato de execução
 
-## 8. Mudanças necessárias no código atual
+```js
+let timer;
+export default {
+  async setup(kiro) {
+    // Registre comandos, ferramentas, eventos e widgets.
+    // Se criar recursos próprios, guarde como liberá-los.
+  },
+  async teardown() {
+    clearInterval(timer);
+  },
+};
+```
 
-| Arquivo | Mudança |
-|---|---|
-| `src/tools.js` | `TOOLS` vira um registro dinâmico: `registerTool()` e `unregisterTool()`. As internas continuam fixas. |
-| `src/app.js` | Substitui o `switch` de comandos por um registro: internos + plugins. Chama `emit` nos eventos do turno e das ferramentas. |
-| `src/tui.js` | Nova faixa de widgets acima do separador. Redesenho só dela com timer. Limite de linhas. |
-| `src/plugins.js` (novo) | Loader, API `kiro`, barramento de eventos, `/plugins`. |
-| `bin/kiro.js` | Nada. |
+`setup(kiro)` é obrigatório e pode ser assíncrono. `teardown()` é opcional e é
+chamado ao desativar ou recarregar. O loader remove os comandos, ferramentas,
+widgets e assinaturas registrados pela API. Timers, subprocessos e outros
+recursos criados diretamente pelo plugin precisam de limpeza própria.
+Não existe um kill automático geral para JavaScript arbitrário.
 
-## 9. Segurança
+O caminho de saída normal do aplicativo não faz uma rodada explícita de
+`teardown` para todos os plugins antes de `process.exit`. Não dependa dele como
+único mecanismo de persistência de dados importantes.
 
-Plugins rodam com os mesmos privilégios do usuário. Isso precisa ser dito na documentação e no `/plugins`. Plano:
+## API entregue ao `setup`
 
-- Só carregar de `~/.kiro/plugins/`. Nada de URL nem auto-instalação.
-- Mostrar a lista de permissões declaradas na primeira vez que um plugin carrega, e pedir confirmação. Guardar a aprovação em `plugins.json` com o hash do arquivo. Se o arquivo mudar, pede de novo.
-- Plugins não recebem o `config.json` nem a `apiKey` dos provedores. Só o próprio `kiro.config`.
+| API | Comportamento atual |
+| --- | --- |
+| `kiro.tool({schema, run})` | Registra ferramenta com nome `plug__<plugin>__<nome>` |
+| `kiro.command(nome, {description, run})` | Registra comando slash; adiciona `/` se faltar |
+| `kiro.widget(id, {render})` | Registra widget na faixa da TUI |
+| `kiro.print(texto, cor?)` | Escreve no histórico da interface |
+| `kiro.on(evento, fn)` | Assina evento; a assinatura é removida pelo loader na limpeza |
+| `kiro.emit(evento, dados)` | Emite evento para os plugins carregados |
+| `kiro.config` | Configuração efetiva do próprio plugin |
+| `kiro.dataDir` | Diretório de dados do plugin no HOME lógico |
+| `kiro.log(mensagem)` | Registra uma mensagem no debug.log local |
 
-## 10. Ordem de implementação
+`command.run(args)` recebe o texto depois do comando, não um objeto de contexto
+adicional. Retornar uma string faz o comando imprimi-la. Evite nomes que colidam
+com comandos internos ou de outros plugins: não há isolamento robusto de colisões.
 
-1. **Loader e API mínima**: `plugins.js`, `kiro.command`, `kiro.print`, `kiro.log`, `/plugins`. Teste com um `hello.js`.
-2. **Ferramentas de plugin**: `kiro.tool` e registro dinâmico em `tools.js`. Teste com uma ferramenta `relogio`.
-3. **Eventos**: `kiro.on` e `kiro.emit` nos pontos do `app.js`. Teste com um plugin que conta turnos.
-4. **Faixa de widgets na TUI** e o `timer.js` como exemplo de referência.
-5. **Plugins em pasta**: `plugin.json`, `main`, imports relativos. Exemplo `agent-kit/` com dois arquivos que se conectam por evento.
-6. **Permissões e aprovação** por hash.
-7. **Recarregar sem reiniciar** (`/plugins reload`).
+### Ferramentas
 
-Cada etapa é testável sozinha e não quebra o que já existe.
+```js
+kiro.tool({
+  schema: {
+    name: 'hora',
+    description: 'Consulta a hora local',
+    parameters: {type: 'object', properties: {}},
+  },
+  async run(args, ctx) {
+    if (ctx.signal?.aborted) throw new Error('cancelado');
+    const text = new Date().toISOString();
+    return {
+      text,
+      ui: {subtitle: 'hora local', lines: [{t: 'o', s: text}]},
+    };
+  },
+});
+```
 
-## 11. Fora do escopo desta versão
+`ctx` pode conter `signal`, `vision` e `log`. Ferramentas de plugin precisam
+cooperar com o cancelamento; um `AbortSignal` não interrompe uma função arbitrária
+nem mata automaticamente subprocessos criados fora das ferramentas internas.
 
-- Instalar plugin de URL ou de um registro (npm, marketplace).
-- Sandbox de execução. Plugins são confiáveis pelo usuário.
-- Plugins escritos em TypeScript sem compilar. Precisa ser JavaScript ESM.
-- Plugins que substituem a TUI inteira.
+`text` volta para o modelo. `ui` descreve a caixa da ferramenta na interface.
+
+### Eventos implementados
+
+| Evento | Dados |
+| --- | --- |
+| `turn:start` | `{text}` |
+| `turn:end` | `{seconds, usage}` |
+| `tool:before` | `{name, args}` |
+| `tool:after` | `{name, status, ms}` |
+| `session:change` | `{id}` |
+| Eventos próprios | Qualquer payload; use um prefixo como `plugin:meu-plugin:evento` |
+
+`tool:after` **não entrega o resultado completo da ferramenta**. O barramento
+chama listeners de forma síncrona, captura exceções síncronas e não aguarda
+Promises retornadas; trate rejeições de operações assíncronas dentro do callback.
+Eventos não são hooks canceláveis e não fornecem aprovação/bloqueio de ferramentas.
+
+### Widgets
+
+```js
+kiro.widget('relogio', {
+  render: () => [`Hora: ${new Date().toLocaleTimeString()}`],
+});
+```
+
+- `render()` retorna um array de linhas.
+- A TUI redesenha aproximadamente a cada **1 segundo** enquanto houver widgets.
+- Um campo `interval` individual **não é usado** pelo loader atual.
+- A faixa limita a saída a seis linhas no total, com indicação de excesso.
+- Linhas vazias não ocupam a faixa; erros de render são ignorados no desenho,
+  não convertem automaticamente o status do plugin em `erro`.
+
+## Aprovação, configuração e recarregamento
+
+| Comando | Ação |
+| --- | --- |
+| `/plugins` ou `/plugins lista` | Lista estado, descrição, comandos e permissões declaradas |
+| `/plugins approve nome` | Grava o hash aprovado e tenta ativar |
+| `/plugins off nome` | Desativa e grava o estado |
+| `/plugins on nome` | Ativa se o hash atual estiver aprovado; senão fica pendente |
+| `/plugins reload` | Limpa instâncias atuais, refaz descoberta e recarrega |
+
+O hash considera os arquivos descobertos do plugin. Após modificar arquivos,
+refaça a descoberta com `/plugins reload` e revise/aprove o novo conteúdo. Não
+edite um plugin aprovado durante seu carregamento esperando uma proteção de sandbox.
+
+O entrypoint é importado com query de cache-busting. Submódulos ESM podem continuar
+na cache do Node; reinicie o processo se alterações em helpers não aparecerem.
+
+O arquivo `<HOME>/plugins.json` tem formato:
+
+```json
+{
+  "approved": {},
+  "disabled": [],
+  "config": {"agent-kit": {"maxPlans": 50}}
+}
+```
+
+Não invente hashes manualmente. Use o comando de aprovação. `kiro.config` faz um
+merge superficial dos defaults do manifesto com `config[nome]`.
+
+Plugins quebrados aparecem com status de erro sem impedir a descoberta dos demais.
+Pastas com manifesto inválido aparecem como erro, não como instalação funcional.
+
+## O que não está implementado
+
+- Marketplace, instalação automática de URLs ou pacotes npm.
+- Sandbox ou enforcement das permissões declaradas.
+- API para substituir toda a TUI.
+- Compilação automática de TypeScript.
+- Kill garantido de processos/timers criados diretamente por código externo.

@@ -1,0 +1,9 @@
+node_modules/
+*.log
+*.pid
+.DS_Store
+.env
+.env.*
+!.env.example
+.kiro/
+coverage/

@@ -1,10 +1,35 @@
 {
   "name": "kiro-code",
   "version": "0.1.0",
-  "description": "Kiro Code: CLI de agente de código leve, pure JS, com TUI colorida",
+  "description": "Agente de programação no terminal em JavaScript puro, sem dependências npm, com múltiplos provedores, sessões persistentes, plugins e MCP.",
   "type": "module",
-  "bin": { "kiro": "bin/kiro.js" },
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node bin/kiro.js" },
-  "license": "MIT"
+  "bin": {
+    "kiro": "bin/kiro.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/kiro.js",
+    "check": "node scripts/check.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zerolimites0001-web/kiro-code.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zerolimites0001-web/kiro-code/issues"
+  },
+  "homepage": "https://github.com/zerolimites0001-web/kiro-code#readme",
+  "keywords": [
+    "ai-agent",
+    "coding-assistant",
+    "cli",
+    "terminal",
+    "tui",
+    "nodejs",
+    "mcp",
+    "plugins"
+  ]
 }
