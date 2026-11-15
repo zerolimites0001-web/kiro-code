@@ -102,6 +102,12 @@ export const PROVIDER_PRESETS = {
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     models: ['meta/llama-3.1-70b-instruct'],
   },
+  google: {
+    label: 'Google AI Studio',
+    type: 'google',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    models: ['gemini-3.8-flash', 'gemini-4-argon'],
+  },
   arena: { label: 'Arena', type: 'openai', baseUrl: 'https://api.arena.ai/v1', models: [] },
   ollama: { label: 'Ollama (local)', type: 'openai', baseUrl: 'http://localhost:11434/v1', models: ['llama3.2'], noKey: true },
 };
@@ -413,6 +419,7 @@ async function anthropicStream({ provider, messages, tools, signal, thinking, on
 
 /** Lista modelos disponíveis do provedor (quando a API suporta) */
 export async function listModels(provider) {
+  if (provider.type === 'google') return listGoogle(provider);
   if (provider.type === 'anthropic') return PROVIDER_PRESETS.anthropic.models.map((id) => ({ id, context: null }));
   const headers = provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {};
   const res = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/models`, { headers });
@@ -447,5 +454,164 @@ export async function listModels(provider) {
 }
 
 export function streamChat(opts) {
+  if (opts.provider.type === 'google') return googleStream(opts);
   return opts.provider.type === 'anthropic' ? anthropicStream(opts) : openaiStream(opts);
+}
+
+/* ---------------- Google Gemini (API nativa) ---------------- */
+
+const GOOGLE_BUDGET = { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32768 };
+const GOOGLE_LEVEL = { minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'high' };
+// Gemini 3+ usa thinkingLevel; 2.5 usa thinkingBudget
+const googleUsesLevel = (model) => /gemini-[34]/.test(model || '');
+const googleId = (name) => String(name || '').replace(/^models\//, '');
+
+function pushContent(list, role, parts) {
+  if (!parts.length) return;
+  const last = list[list.length - 1];
+  if (last && last.role === role) last.parts.push(...parts);
+  else list.push({ role, parts });
+}
+
+function toGoogle(messages) {
+  const names = {};
+  let system;
+  const contents = [];
+  for (const m of messages) {
+    if (m.role === 'system') {
+      system = (system ? system + '\n' : '') + m.content;
+      continue;
+    }
+    if (m.role === 'tool') {
+      pushContent(contents, 'user', [
+        { functionResponse: { name: names[m.tool_call_id] || 'tool', response: { result: m.content } } },
+      ]);
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const parts = [];
+      if (m.content) parts.push({ text: m.content });
+      for (const t of m.tool_calls || []) {
+        names[t.id] = t.name;
+        const part = { functionCall: { name: t.name, args: t.arguments || {} } };
+        // assinatura do pensamento precisa voltar junto da tool call (Gemini 3)
+        if (t.thoughtSignature) part.thoughtSignature = t.thoughtSignature;
+        parts.push(part);
+      }
+      pushContent(contents, 'model', parts);
+      continue;
+    }
+    const parts = [];
+    if (m.content) parts.push({ text: m.content });
+    for (const i of m.images || []) parts.push({ inlineData: { mimeType: i.mime, data: i.data } });
+    pushContent(contents, 'user', parts.length ? parts : [{ text: '' }]);
+  }
+  return { system, contents };
+}
+
+async function googleStream({ provider, messages, tools, signal, thinking, onText, onThinking, onRetry }) {
+  const { system, contents } = toGoogle(messages);
+  const generationConfig = {};
+  // limite de saída: só envia quando o provedor informa (vem do endpoint)
+  if (provider.maxOutput) generationConfig.maxOutputTokens = provider.maxOutput;
+  if (thinking && thinking !== 'off') {
+    generationConfig.thinkingConfig = { includeThoughts: true };
+    if (googleUsesLevel(provider.model)) generationConfig.thinkingConfig.thinkingLevel = GOOGLE_LEVEL[thinking];
+    else generationConfig.thinkingConfig.thinkingBudget = GOOGLE_BUDGET[thinking];
+  }
+  const body = {
+    contents,
+    ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
+    ...(tools.length ? { tools: [{ functionDeclarations: tools.map((t) => t.schema) }] } : {}),
+    generationConfig,
+  };
+  const base = provider.baseUrl.replace(/\/$/, '');
+  const url = `${base}/models/${googleId(provider.model)}:streamGenerateContent?alt=sse`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (provider.apiKey) headers['x-goog-api-key'] = provider.apiKey;
+
+  return withRetry(
+    async () => {
+      const res = await fetch(url, { method: 'POST', headers, signal, body: JSON.stringify(body) });
+      await assertOk(res);
+
+      let content = '';
+      let emitted = '';
+      const calls = [];
+      let usage = { input: 0, output: 0 };
+      try {
+        for await (const chunk of sse(res.body)) {
+          const u = chunk.usageMetadata;
+          if (u) {
+            usage = {
+              input: u.promptTokenCount || 0,
+              output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0),
+            };
+          }
+          for (const cand of chunk.candidates || []) {
+            for (const part of cand.content?.parts || []) {
+              if (part.functionCall) {
+                calls.push({
+                  id: `call_${calls.length}_${Date.now()}`,
+                  name: part.functionCall.name,
+                  arguments: part.functionCall.args || {},
+                  thoughtSignature: part.thoughtSignature,
+                });
+              } else if (part.text) {
+                if (part.thought) onThinking?.(part.text);
+                else {
+                  content += part.text;
+                  emitted += part.text;
+                  onText?.(part.text);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        err.partialText = emitted;
+        throw err;
+      }
+      return { content, usage, tool_calls: calls };
+    },
+    {
+      signal,
+      tries: provider.retries,
+      delay: provider.retryDelay,
+      onRetry: (info) => onRetry?.({ ...info, provider: 'google' }),
+    },
+  );
+}
+
+// modelos que não são de chat (imagem, áudio, embedding, etc.)
+const GOOGLE_NON_CHAT = /image|banana|tts|embedding|lyria|transcribe|omni|robotics|computer-use|deep-research|antigravity|live|native-audio|aqa/;
+
+async function listGoogle(provider) {
+  const base = provider.baseUrl.replace(/\/$/, '');
+  const headers = provider.apiKey ? { 'x-goog-api-key': provider.apiKey } : {};
+  const all = [];
+  let pageToken = '';
+  do {
+    const res = await fetch(`${base}/models?pageSize=1000${pageToken ? `&pageToken=${pageToken}` : ''}`, { headers });
+    await assertOk(res);
+    const json = await res.json();
+    all.push(...(json.models || []));
+    pageToken = json.nextPageToken || '';
+  } while (pageToken);
+
+  return all
+    .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .filter((m) => !GOOGLE_NON_CHAT.test(googleId(m.name)))
+    .map((m) => {
+      const id = googleId(m.name);
+      return {
+        id,
+        // limites vêm direto da API (inputTokenLimit / outputTokenLimit)
+        context: m.inputTokenLimit || null,
+        output: m.outputTokenLimit || null,
+        reasoning: /gemini-(2\.5|[34])/.test(id) ? true : null,
+        vision: /gemini/.test(id),
+      };
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
 }

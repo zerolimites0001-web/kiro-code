@@ -105,8 +105,8 @@ const estimateTokens = (msgs) => Math.ceil(JSON.stringify(msgs).length / 4);
 const activeProvider = () => (cfg.active ? cfg.providers[cfg.active] : null);
 const callable = (p) => {
   // limite de saída forçado só para o provedor arena (131000); os demais seguem como antes
-  const arena = !!forcedFor(p);
-  const m = arena && p.defaultModel ? effectiveMeta(p, p.defaultModel, cfg.active, catalog) : null;
+  const limited = !!forcedFor(p) || p.type === 'google';
+  const m = limited && p.defaultModel ? effectiveMeta(p, p.defaultModel, cfg.active, catalog) : null;
   return { ...p, model: p.defaultModel, maxOutput: m ? m.output : undefined };
 };
 
