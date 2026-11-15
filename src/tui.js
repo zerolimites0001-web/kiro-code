@@ -362,6 +362,9 @@ export class TUI {
     this._pendingInput = null; // buffer de colagem (null = vazio)
     this._pendingTimer = null;
     this.entries = []; // { kind: text|user|thinking|tool, ... }
+    // janela visual: só as últimas `windowSize` entradas são desenhadas (o histórico inteiro continua no contexto)
+    this.windowSize = 100;
+    this.windowStart = null; // null = últimas windowSize; ao rolar pro topo, sobe 50 a 50
     this.partial = '';
     this.partialThink = '';
     this.input = '';
@@ -486,6 +489,7 @@ export class TUI {
 
   clear() {
     this.entries = [];
+    this.windowStart = null;
     this.partial = '';
     this.partialThink = '';
     this.scroll = 0;
@@ -940,10 +944,15 @@ export class TUI {
     return out;
   }
 
+  topIndex() {
+    return this.windowStart ?? Math.max(0, this.entries.length - this.windowSize);
+  }
+
   renderAll(w, owners = null) {
     const out = [];
     const key = `${w}|${this.expanded}`;
-    for (const e of this.entries) {
+    for (let idx = this.topIndex(); idx < this.entries.length; idx++) {
+      const e = this.entries[idx];
       // Cache por entrada. Para tools a chave inclui estado/linhas, senão o bloco congelava
       // em "run"; com o cache por linha, cada quadro só re-renderiza o que realmente mudou.
       const ekey =
@@ -1095,8 +1104,14 @@ export class TUI {
       dock.push(`${FG.warn}${frame} Working${dots} ${FG.dim}· ${this.busyLabel} · ${secs}s · ESC para interromper${R}`);
     }
     const bodyH = Math.max(3, rows - 4 - dock.length);
-    const owners = [];
-    const all = this.renderAll(cols, owners);
+    let owners = [];
+    let all = this.renderAll(cols, owners);
+    // chegou perto do topo da janela visual: carrega mais 50 entradas para cima
+    if (all.length - this.scroll - bodyH <= 5 && this.topIndex() > 0) {
+      this.windowStart = Math.max(0, this.topIndex() - 50);
+      owners = [];
+      all = this.renderAll(cols, owners);
+    }
     const end = Math.max(0, all.length - this.scroll);
     // slice do corpo junto com os donos: é isso que permite saber em qual bloco
     // o usuário clicou (o número da linha sozinho não diz nada)

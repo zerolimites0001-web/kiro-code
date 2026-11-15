@@ -98,7 +98,16 @@ function forceStop() {
   tui.draw();
 }
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n) + '…' : String(s));
-const estimateTokens = (msgs) => Math.ceil(JSON.stringify(msgs).length / 4);
+// conta só o que vai para o modelo (conteúdo, pensamento, chamadas, nome).
+// Antes contava o objeto inteiro, incluindo `ui` (cópia renderizada da saída de ferramenta),
+// o que inflava o % e disparava o auto-compact à toa.
+const estimateTokens = (msgs) =>
+  Math.ceil(
+    msgs.reduce(
+      (n, m) => n + JSON.stringify({ r: m.role, c: m.content, t: m.thinking, k: m.tool_calls, n: m.name }).length,
+      0,
+    ) / 4,
+  );
 
 /* ---------------- estado ---------------- */
 
