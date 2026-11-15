@@ -20,7 +20,7 @@ import {
 } from './store.js';
 import { listInstances, pruneInstances, GLOBAL_HOME } from './instance.js';
 import { PROVIDER_PRESETS, THINK_LEVELS, streamChat, listModels, withRetry, RETRY_TRIES, RETRY_DELAY } from './providers.js';
-import { TOOLS, getTool } from './tools.js';
+import { TOOLS, getTool, killActive } from './tools.js';
 import {
   loadCatalog,
   effectiveMeta,
@@ -29,6 +29,9 @@ import {
   clampThink,
   fmtTokens,
   parseTokens,
+  hasCatalogFor,
+  applyForced,
+  forcedFor,
 } from './meta.js';
 import { loadMcp, saveMcp, connectServer, disconnectServer, startMcp, mcpStatus } from './mcp.js';
 import { setHost, loadPlugins, emit, getPluginCommand, pluginCommandList, pluginsCommand } from './plugins.js';
@@ -72,7 +75,27 @@ function interruptTurn() {
       abortCtl.abort();
     } catch {}
   }
+  // rede de segurança: se o turno não terminar em 3s (stream preso, tool ignorando o cancelamento),
+  // força o fim para a TUI não ficar presa em "interrompendo"
+  setTimeout(() => {
+    if (busy && interrupting) forceStop();
+  }, 3000).unref?.();
   return true;
+}
+
+/** Interrupção forçada: mata processos, solta a TUI na hora. Chamada no 2º ESC/Ctrl+C. */
+function forceStop() {
+  interrupting = true;
+  try {
+    abortCtl?.abort();
+  } catch {}
+  killActive();
+  busy = false;
+  queue.length = 0;
+  tui.setBusy('');
+  tui.print('[interrupção forçada]', FG.warn);
+  refreshStatus();
+  tui.draw();
 }
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n) + '…' : String(s));
 const estimateTokens = (msgs) => Math.ceil(JSON.stringify(msgs).length / 4);
@@ -80,7 +103,12 @@ const estimateTokens = (msgs) => Math.ceil(JSON.stringify(msgs).length / 4);
 /* ---------------- estado ---------------- */
 
 const activeProvider = () => (cfg.active ? cfg.providers[cfg.active] : null);
-const callable = (p) => ({ ...p, model: p.defaultModel });
+const callable = (p) => {
+  // limite de saída forçado só para o provedor arena (131000); os demais seguem como antes
+  const arena = !!forcedFor(p);
+  const m = arena && p.defaultModel ? effectiveMeta(p, p.defaultModel, cfg.active, catalog) : null;
+  return { ...p, model: p.defaultModel, maxOutput: m ? m.output : undefined };
+};
 
 function effectiveThinking(name, p) {
   const m = effectiveMeta(p, p.defaultModel, name, catalog);
@@ -235,6 +263,14 @@ async function runTurn(userText) {
       if (interrupting) throw abortError('cancelado pelo usuário');
 
       abortCtl = new AbortController();
+      if (shouldAutoCompact()) {
+        try {
+          await runCompaction(true);
+        } catch (err) {
+          if (err.name === 'AbortError' || interrupting) throw abortError('cancelado pelo usuário');
+          tui.print(`Erro ao compactar automaticamente: ${err.message}`, FG.err);
+        }
+      }
       tui.setBusy(step === 0 ? 'pensando' : 'continuando');
 
       let thought = '';
@@ -348,6 +384,80 @@ function transcript(msgs) {
     .join('\n\n');
 }
 
+/** Gera o resumo do histórico, mostrando a escrita ao vivo numa caixa roxa. */
+async function runCompaction(auto = false) {
+  const p = activeProvider();
+  const lastUser = [...session.messages].reverse().find((m) => m.role === 'user')?.content;
+  const box = tui.addTool(auto ? 'compactando contexto (automático)' : 'compactando contexto', p.defaultModel);
+  box.compact = true;
+  box.expanded = true;
+  let live = '';
+  let pending = null;
+  const repaint = () => {
+    // redesenho agrupado: a cada 120ms no máximo, para não travar a TUI
+    if (pending) return;
+    pending = setTimeout(() => {
+      pending = null;
+      box.lines = live.split('\n').slice(-300).map((s) => ({ t: ' ', s }));
+      tui.draw();
+    }, 120);
+  };
+  try {
+    const res = await streamChat({
+      provider: callable(p),
+      messages: [{ role: 'user', content: `${transcript(session.messages)}\n\n${COMPACT_PROMPT}` }],
+      tools: [],
+      signal: abortCtl.signal,
+      thinking: 'off',
+      onText: (d) => {
+        live += d;
+        repaint();
+      },
+      onThinking: () => {},
+    });
+    clearTimeout(pending);
+    box.lines = String(res.content || '').split('\n').slice(-300).map((s) => ({ t: ' ', s }));
+    box.status = 'ok';
+    box.subtitle = `${(res.content || '').length} caracteres`;
+    box.endedAt = Date.now();
+    // substitui o histórico, mas guarda backup completo antes
+    const bak = backupSession(session, auto ? 'auto-compact' : 'pre-compact');
+    session.messages = [
+      session.messages[0],
+      { role: 'user', content: `Resumo da conversa anterior:\n${res.content}` },
+      { role: 'assistant', content: 'Entendido. Continuo a partir desse resumo.' },
+    ];
+    // no automático, o pedido que estava em andamento volta para a IA continuar
+    if (auto && lastUser) session.messages.push({ role: 'user', content: lastUser });
+    session.compactedAt = new Date().toISOString();
+    lastInput = estimateTokens(session.messages);
+    persist(true);
+    tui.print(
+      `Contexto compactado${auto ? ' automaticamente (85%)' : ''}. Histórico completo preservado em ${bak ? bak.split('/').pop() : 'backup'}.`,
+      FG.ok,
+    );
+  } catch (err) {
+    clearTimeout(pending);
+    box.status = 'err';
+    box.endedAt = Date.now();
+    box.lines.push({ t: 'e', s: err.name === 'AbortError' ? 'compactação cancelada' : err.message });
+    throw err;
+  } finally {
+    tui.draw();
+  }
+}
+
+/** Compacta quando o contexto passa de 85% da janela do modelo ativo. */
+function shouldAutoCompact() {
+  const p = activeProvider();
+  if (!p || !p.defaultModel || !session) return false;
+  const ctx = effectiveMeta(p, p.defaultModel, cfg.active, catalog).context;
+  if (!ctx) return false;
+  const used = lastInput || estimateTokens(session.messages);
+  const real = session.messages.filter((m) => m.role !== 'system').length;
+  return real >= 4 && used >= ctx * 0.85;
+}
+
 async function compact() {
   const p = activeProvider();
   if (!p || !p.defaultModel) return tui.print('Nenhum modelo ativo. Use /login.', FG.err);
@@ -358,32 +468,9 @@ async function compact() {
   abortCtl = new AbortController();
   tui.setBusy('compactando contexto');
   try {
-    const res = await streamChat({
-      provider: callable(p),
-      messages: [{ role: 'user', content: `${transcript(session.messages)}\n\n${COMPACT_PROMPT}` }],
-      tools: [],
-      signal: abortCtl.signal,
-      thinking: 'off',
-      onText: () => {},
-      onThinking: () => {},
-    });
-    // O /compact substitui o histórico inteiro — sem backup isso era perda
-    // irreversível de metade do chat. O .pre-compact guarda a versão completa.
-    const bak = backupSession(session, 'pre-compact');
-    session.messages = [
-      session.messages[0],
-      { role: 'user', content: `Resumo da conversa anterior:\n${res.content}` },
-      { role: 'assistant', content: 'Entendido. Continuo a partir desse resumo.' },
-    ];
-    session.compactedAt = new Date().toISOString();
-    lastInput = estimateTokens(session.messages);
-    persist(true);
-    tui.print(
-      `Contexto compactado. Histórico completo preservado em ${bak ? bak.split('/').pop() : 'backup'}.`,
-      FG.ok,
-    );
+    await runCompaction(false);
   } catch (err) {
-    tui.print(err.name === 'AbortError' ? '[compactação cancelada]' : `Erro ao compactar: ${err.message}`, FG.err);
+    if (err.name !== 'AbortError') tui.print(`Erro ao compactar: ${err.message}`, FG.err);
   } finally {
     busy = false;
     interrupting = false;
@@ -473,8 +560,15 @@ async function syncProvider(name) {
       entry._src.input = 'endpoint';
     }
     fillFromCatalog(entry, p, name, catalog);
+    applyForced(entry, p);
     return entry;
   });
+
+  const noMeta = !list.some((x) => x.context) && !hasCatalogFor(catalog, name, p.baseUrl, p.catalog);
+  if (noMeta) {
+    tui.print(`${name}: o endpoint não informa contexto e o models.dev não tem esse provedor.`, FG.warn);
+    tui.print('Defina "catalog": "<id do provedor no models.dev>" no provedor (ex: "openai") ou edite os limites em /mod-provider.', FG.warn);
+  }
 
   if (!p.models.some((m) => m.id === p.defaultModel)) p.defaultModel = p.models[0]?.id || null;
   saveConfig(cfg);
@@ -1042,6 +1136,7 @@ export async function run() {
     // Não exige abortCtl: entre passos ele fica nulo por um instante, mas o
     // flag `interrupting` já garante que o turno não continua.
     if (busy) {
+      if (interrupting) return forceStop(); // 2º Ctrl+C: interrompe de vez
       interruptTurn();
       tui.setBusy('interrompendo');
       return;
@@ -1054,6 +1149,7 @@ export async function run() {
 
   tui.onEsc = () => {
     if (busy) {
+      if (interrupting) return forceStop(); // 2º ESC: força
       interruptTurn();
       tui.setBusy('interrompendo');
     }

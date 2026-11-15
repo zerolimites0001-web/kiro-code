@@ -102,12 +102,7 @@ export const PROVIDER_PRESETS = {
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     models: ['meta/llama-3.1-70b-instruct'],
   },
-  google: {
-    label: 'Google (Gemini)',
-    type: 'google',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
-  },
+  arena: { label: 'Arena', type: 'openai', baseUrl: 'https://api.arena.ai/v1', models: [] },
   ollama: { label: 'Ollama (local)', type: 'openai', baseUrl: 'http://localhost:11434/v1', models: ['llama3.2'], noKey: true },
 };
 
@@ -229,7 +224,7 @@ function toOpenAIMessages(messages) {
   });
 }
 
-async function openaiStream({ provider, messages, tools, signal, thinking, onText, onThinking, onRetry }) {
+async function openaiStream({ provider, messages, tools, signal, thinking, onText, onThinking }) {
   const headers = { 'Content-Type': 'application/json' };
   if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
 
@@ -241,6 +236,7 @@ async function openaiStream({ provider, messages, tools, signal, thinking, onTex
     ...(tools.length ? { tools: tools.map((t) => ({ type: 'function', function: t.schema })) } : {}),
   };
   if (thinking && thinking !== 'off') body.reasoning_effort = OPENAI_EFFORT[thinking];
+  if (provider.maxOutput) body.max_tokens = provider.maxOutput;
 
   return withRetry(
     async () => {
@@ -299,7 +295,7 @@ async function openaiStream({ provider, messages, tools, signal, thinking, onTex
       signal,
       tries: provider.retries,
       delay: provider.retryDelay,
-      onRetry: (info) => onRetry?.({ ...info, provider: 'openai' }),
+      onRetry: (info) => opts.onRetry?.({ ...info, provider: 'openai' }),
     },
   );
 }
@@ -338,13 +334,15 @@ function toAnthropic(messages) {
   return { system, messages: out };
 }
 
-async function anthropicStream({ provider, messages, tools, signal, thinking, onText, onThinking, onRetry }) {
+async function anthropicStream({ provider, messages, tools, signal, thinking, onText, onThinking }) {
   const { system, messages: msgs } = toAnthropic(messages);
   const budget = thinking && thinking !== 'off' ? ANTHROPIC_BUDGET[thinking] : 0;
 
   const body = {
     model: provider.model,
-    max_tokens: budget ? budget + 4096 : 4096,
+    max_tokens: provider.maxOutput
+      ? Math.max(provider.maxOutput, budget ? budget + 1024 : 0)
+      : budget ? budget + 4096 : 4096,
     stream: true,
     system,
     messages: msgs,
@@ -408,14 +406,13 @@ async function anthropicStream({ provider, messages, tools, signal, thinking, on
       signal,
       tries: provider.retries,
       delay: provider.retryDelay,
-      onRetry: (info) => onRetry?.({ ...info, provider: 'anthropic' }),
+      onRetry: (info) => opts.onRetry?.({ ...info, provider: 'anthropic' }),
     },
   );
 }
 
 /** Lista modelos disponíveis do provedor (quando a API suporta) */
 export async function listModels(provider) {
-  if (provider.type === 'google') return listGoogleModels(provider);
   if (provider.type === 'anthropic') return PROVIDER_PRESETS.anthropic.models.map((id) => ({ id, context: null }));
   const headers = provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {};
   const res = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/models`, { headers });
@@ -449,211 +446,6 @@ export async function listModels(provider) {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-/* ---------------- Google Gemini (API nativa) ----------------
- * Não usa o endpoint compatível com OpenAI: o formato nativo tem
- *   - contents[] com parts (text | functionCall | functionResponse | inlineData)
- *   - role "model" em vez de "assistant"
- *   - tool result como functionResponse, ligado pelo NOME da função
- *   - thinking via generationConfig.thinkingConfig (thinkingLevel nos Gemini 3,
- *     thinkingBudget nos 2.5)
- *   - uso em usageMetadata, cumulativo em cada chunk (vale o último)
- *   - SSE sem [DONE]: o stream simplesmente termina
- *   - thoughtSignature: o Gemini 3 exige que a assinatura da functionCall
- *     volte na próxima requisição, senão a continuação da tool call falha.
- */
-
-const GOOGLE_BUDGET = { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 24576 };
-const GOOGLE_LEVEL = { minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'high' };
-const isGemini3 = (model = '') => /gemini-3/.test(model);
-
-/** Schema JSON -> subconjunto aceito pelo Gemini (sem additionalProperties/$schema) */
-function cleanSchema(node) {
-  if (Array.isArray(node)) return node.map(cleanSchema);
-  if (!node || typeof node !== 'object') return node;
-  const out = {};
-  for (const [k, v] of Object.entries(node)) {
-    if (k === 'additionalProperties' || k === '$schema') continue;
-    out[k] = cleanSchema(v);
-  }
-  return out;
-}
-
-function toGoogle(messages) {
-  const system = messages
-    .filter((m) => m.role === 'system' && m.content)
-    .map((m) => m.content)
-    .join('\n\n');
-
-  // tool_call_id -> nome da função (functionResponse precisa do nome)
-  const names = {};
-  for (const m of messages) for (const t of m.tool_calls || []) names[t.id] = t.name;
-
-  const contents = [];
-  const push = (role, parts) => {
-    if (!parts.length) return;
-    const last = contents[contents.length - 1];
-    if (last && last.role === role) last.parts.push(...parts);
-    else contents.push({ role, parts });
-  };
-
-  for (const m of messages) {
-    if (m.role === 'system') continue;
-    if (m.role === 'tool') {
-      push('user', [
-        {
-          functionResponse: {
-            name: names[m.tool_call_id] || 'tool',
-            response: { content: m.content ?? '' },
-          },
-        },
-      ]);
-      continue;
-    }
-    if (m.role === 'assistant') {
-      const parts = [];
-      if (m.content) parts.push({ text: m.content });
-      for (const t of m.tool_calls || []) {
-        const part = { functionCall: { name: t.name, args: t.arguments || {} } };
-        if (t.thoughtSignature) part.thoughtSignature = t.thoughtSignature;
-        parts.push(part);
-      }
-      push('model', parts);
-      continue;
-    }
-    // user
-    const parts = (m.images || []).map((i) => ({ inlineData: { mimeType: i.mime, data: i.data } }));
-    if (m.content) parts.push({ text: m.content });
-    push('user', parts.length ? parts : [{ text: ' ' }]);
-  }
-  return { system, contents };
-}
-
-async function googleStream({ provider, messages, tools, signal, thinking, onText, onThinking, onRetry }) {
-  const model = provider.model;
-  const { system, contents } = toGoogle(messages);
-
-  const generationConfig = {};
-  if (thinking && thinking !== 'off') {
-    generationConfig.thinkingConfig = isGemini3(model)
-      ? { thinkingLevel: GOOGLE_LEVEL[thinking], includeThoughts: true }
-      : { thinkingBudget: GOOGLE_BUDGET[thinking], includeThoughts: true };
-  }
-
-  const body = {
-    contents,
-    ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
-    ...(tools.length
-      ? {
-          tools: [
-            {
-              functionDeclarations: tools.map((t) => ({
-                name: t.schema.name,
-                description: t.schema.description,
-                parameters: cleanSchema(t.schema.parameters),
-              })),
-            },
-          ],
-        }
-      : {}),
-    ...(Object.keys(generationConfig).length ? { generationConfig } : {}),
-  };
-
-  const base = provider.baseUrl.replace(/\/$/, '');
-  const url = `${base}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-
-  return withRetry(
-    async () => {
-      const res = await fetch(url, {
-        method: 'POST',
-        signal,
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': provider.apiKey || '' },
-        body: JSON.stringify(body),
-      });
-      await assertOk(res);
-
-      let content = '';
-      const calls = [];
-      let usage = { input: 0, output: 0 };
-      let emitted = '';
-      try {
-        for await (const ev of sse(res.body)) {
-          if (ev.error) {
-            const err = new Error(`google: ${ev.error.message || 'erro no stream'}`);
-            err.status = ev.error.code;
-            err.partialText = emitted;
-            throw err;
-          }
-          if (ev.usageMetadata) {
-            const u = ev.usageMetadata;
-            // cumulativo: o último chunk traz o total. Thinking é cobrado como saída.
-            usage = {
-              input: u.promptTokenCount || 0,
-              output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0),
-            };
-          }
-          for (const cand of ev.candidates || []) {
-            for (const p of cand.content?.parts || []) {
-              if (p.functionCall) {
-                calls.push({
-                  id: p.functionCall.id || `call_${calls.length}_${Date.now()}`,
-                  name: p.functionCall.name,
-                  arguments: p.functionCall.args || {},
-                  thoughtSignature: p.thoughtSignature,
-                });
-              } else if (p.text) {
-                if (p.thought) onThinking?.(p.text);
-                else {
-                  content += p.text;
-                  emitted += p.text;
-                  onText?.(p.text);
-                }
-              }
-            }
-          }
-        }
-      } catch (err) {
-        if (!err.partialText) err.partialText = emitted;
-        throw err;
-      }
-      return { content, usage, tool_calls: calls };
-    },
-    {
-      signal,
-      tries: provider.retries,
-      delay: provider.retryDelay,
-      onRetry: (info) => onRetry?.({ ...info, provider: 'google' }),
-    },
-  );
-}
-
-/** Lista modelos pela API nativa (paginada). Visão não vem da API: fica null (models.dev completa). */
-async function listGoogleModels(provider) {
-  const base = provider.baseUrl.replace(/\/$/, '');
-  const out = [];
-  let pageToken = '';
-  do {
-    const url = `${base}/models?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
-    const res = await fetch(url, { headers: { 'x-goog-api-key': provider.apiKey || '' } });
-    await assertOk(res);
-    const json = await res.json();
-    for (const m of json.models || []) {
-      if (!m.supportedGenerationMethods?.includes('generateContent')) continue;
-      out.push({
-        id: String(m.name || '').replace(/^models\//, ''),
-        context: m.inputTokenLimit || null,
-        output: m.outputTokenLimit || null,
-        reasoning: typeof m.thinking === 'boolean' ? m.thinking : null,
-        vision: null,
-      });
-    }
-    pageToken = json.nextPageToken || '';
-  } while (pageToken);
-  return out.sort((a, b) => a.id.localeCompare(b.id));
-}
-
 export function streamChat(opts) {
-  const t = opts.provider.type;
-  if (t === 'anthropic') return anthropicStream(opts);
-  if (t === 'google') return googleStream(opts);
-  return openaiStream(opts);
+  return opts.provider.type === 'anthropic' ? anthropicStream(opts) : openaiStream(opts);
 }

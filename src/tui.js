@@ -360,10 +360,6 @@ export class TUI {
     this.input = '';
     this.cursor = 0;
     this._pendingInput = null; // buffer de colagem (null = vazio)
-    this.pastes = new Map(); // colagens grandes: id -> texto completo (o input mostra só um marcador)
-    this._pasteSeq = 0;
-    this._pasting = false; // dentro de um bracketed paste (\x1b[200~ ... \x1b[201~)
-    this._pasteBuf = '';
     this._pendingTimer = null;
     this.entries = []; // { kind: text|user|thinking|tool, ... }
     this.partial = '';
@@ -403,7 +399,7 @@ export class TUI {
 
   start() {
     // ?7l = sem quebra automática: linha maior que a tela corta à direita em vez de empurrar a tela
-    process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h\x1b[?2004h');
+    process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h');
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
@@ -419,7 +415,7 @@ export class TUI {
   stop() {
     clearInterval(this.timer);
     this._prevFrame = null;
-    process.stdout.write('\x1b[?2004l\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l' + R);
+    process.stdout.write('\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l' + R);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
   }
 
@@ -603,40 +599,6 @@ export class TUI {
   /* ---------- entrada ---------- */
 
   onData(data) {
-    const START = '\x1b[200~';
-    const END = '\x1b[201~';
-    let rest = data;
-    while (rest.length) {
-      if (this._pasting) {
-        const e = rest.indexOf(END);
-        if (e < 0) {
-          this._pasteBuf += rest;
-          break;
-        }
-        this._pasteBuf += rest.slice(0, e);
-        rest = rest.slice(e + END.length);
-        this._pasting = false;
-        const text = this._pasteBuf;
-        this._pasteBuf = '';
-        this.insertPaste(text);
-        continue;
-      }
-      const st = rest.indexOf(START);
-      const chunk = st < 0 ? rest : rest.slice(0, st);
-      if (chunk) this.onKeysData(chunk);
-      if (st < 0) break;
-      rest = rest.slice(st + START.length);
-      this._pasting = true;
-    }
-    this.draw();
-  }
-
-  /** Teclas e mouse de um pedaço de entrada (sem paste marcado) */
-  onKeysData(data) {
-    // sem bracketed paste (terminal antigo): um pedaço longo que não começa com escape é colagem
-    if (data.length > 1 && !data.startsWith('\x1b') && !/^[\x00-\x1f]$/.test(data)) {
-      return this.insertPaste(data);
-    }
     const mouse = data.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g);
     if (mouse) {
       for (const raw of mouse) {
@@ -648,40 +610,10 @@ export class TUI {
         else if (btn === 65) this.scroll = Math.max(0, this.scroll - 3);
         else if (kind === 'M' && btn === 0) this.onClick(row, col); // clique esquerdo
       }
-      return;
+      return this.draw();
     }
     for (const key of data.match(/\x1b\[[0-9;]*[~A-Za-z]|\x1b.|[\s\S]/g) || []) this.onKey(key);
-  }
-
-  /**
-   * Cola um bloco inteiro de texto no cursor, sem enviar nada.
-   * Colagens grandes (várias linhas ou muito longas) viram um marcador curto
-   * "[colado #n: ...]"; o texto completo fica em this.pastes e é expandido no envio.
-   */
-  insertPaste(raw) {
-    this._flushPendingInput();
-    const text = String(raw)
-      .replace(/\r\n?/g, '\n')
-      .replace(/\t/g, '    ')
-      .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
-    if (!text) return;
-    const lines = text.split('\n').length;
-    let insert = text;
-    if (lines > 1 || text.length > 300) {
-      const id = ++this._pasteSeq;
-      this.pastes.set(id, text);
-      insert = `[colado #${id}: ${lines} linha${lines > 1 ? 's' : ''}, ${text.length} chars]`;
-    }
-    const segs = [...graphemes(this.input)].map((x) => x.segment);
-    const add = [...graphemes(insert)].map((x) => x.segment);
-    segs.splice(this.cursor, 0, ...add);
-    this.input = segs.join('');
-    this.cursor += add.length;
-  }
-
-  /** Troca os marcadores "[colado #n: ...]" pelo texto real */
-  expandPastes(text) {
-    return text.replace(/\[colado #(\d+): [^\]]*\]/g, (m, id) => (this.pastes.has(+id) ? this.pastes.get(+id) : m));
+    this.draw();
   }
 
   /**
@@ -748,16 +680,9 @@ export class TUI {
     else if (k === '\x1b[A') this.historyNav(-1);
     else if (k === '\x1b[B') this.historyNav(1);
     else if (!k.startsWith('\x1b')) {
-      // buffer de colagem: acumula caracteres rápidos e faz um só draw
-      if (this._pendingInput == null) {
-        this._pendingInput = '';
-        this._pendingTimer = null;
-      }
-      this._pendingInput += k;
-      clearTimeout(this._pendingTimer);
-      this._pendingTimer = setTimeout(() => {
-        this._flushPendingInput();
-      }, 15);
+      // insere já: antes havia um buffer de 15ms que fazia o texto ficar para trás
+      this._pendingInput = k;
+      this._flushPendingInput();
     }
   }
 
@@ -877,8 +802,7 @@ export class TUI {
   }
 
   submit() {
-    const shown = this.input;
-    const text = this.expandPastes(shown);
+    const text = this.input;
     this.input = '';
     this.cursor = 0;
     this.hIdx = -1;
@@ -887,7 +811,7 @@ export class TUI {
       this.asker = null;
       return a.resolve(text.trim());
     }
-    if (shown.trim()) this.history.push(shown);
+    if (text.trim()) this.history.push(text);
     this.onSubmit(text);
   }
 
@@ -950,12 +874,16 @@ export class TUI {
 
   renderTool(e, w) {
     const shell = SHELL_TOOLS.test(String(e.title || ''));
-    const bg = shell
-      ? e.status === 'err' ? BG.bashErr : BG.bashOk   // shell: corpo sempre preto
-      : e.status === 'ok' ? BG.ok : e.status === 'err' ? BG.err : BG.run;
+    const bg = e.compact
+      ? '\x1b[48;5;54m' // roxo escuro: compactação de contexto
+      : shell
+        ? e.status === 'err' ? BG.bashErr : BG.bashOk   // shell: corpo sempre preto
+        : e.status === 'ok' ? BG.ok : e.status === 'err' ? BG.err : BG.run;
     const bgHead = shell ? BG.bashHead : bg;
     // trilha lateral: a cor de estado fica só nela, o resto da caixa é preto
-    const rail = shell
+    const rail = e.compact
+      ? '\x1b[38;5;141m'
+      : shell
       ? e.status === 'err' ? RAIL_ERR : e.status === 'run' ? RAIL_RUN : RAIL_OK
       : e.status === 'err' ? FG.err : e.status === 'run' ? FG.warn : FG.ok;
     const MARK = '\u258c'; // ▌
@@ -979,7 +907,8 @@ export class TUI {
     const rows = e.lines;
     // aberto = estado do próprio bloco (clique) ou, se nunca clicado, o global (ctrl+o)
     const open = e.expanded ?? this.expanded;
-    const limit = open || rows.length <= COLLAPSE_ROWS ? rows.length : COLLAPSE_ROWS;
+    const MAX_OPEN = 300;
+    const limit = open ? Math.min(rows.length, MAX_OPEN) : rows.length <= COLLAPSE_ROWS ? rows.length : COLLAPSE_ROWS;
     const hidden = rows.length - limit;
     const inner = Math.max(4, w - 4); // ▌(1) + espaço(1) + │(1) + espaço(1) = 4 colunas de moldura
 
@@ -1022,7 +951,7 @@ export class TUI {
           ? `${key}|${e.expanded ?? ''}|${e.status}|${e.status === 'run' ? this.spin : ''}|${e.lines.length}|${e.lines[e.lines.length - 1]?.s ?? ''}|${e.subtitle ?? ''}|${e.endedAt ?? 0}`
           : e.kind === 'thinking'
             ? `${key}|${e.text.length}`
-            : key;
+            : `${w}`;
       if (!e._cache || e._cache.key !== ekey) {
         let lines = [];
         if (e.kind === 'tool') lines = this.renderTool(e, w);
@@ -1152,7 +1081,7 @@ export class TUI {
     this.drawTimer = setTimeout(() => {
       this.drawTimer = null;
       this.paint();
-    }, 40);
+    }, 16);
   }
 
   paint() {

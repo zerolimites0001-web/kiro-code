@@ -51,7 +51,9 @@ const hostOf = (u) => {
 };
 
 /** Acha o id do provedor no catálogo: pelo nome, ou pelo host do endpoint (campo api) */
-function catalogProviderId(catalog, name, baseUrl) {
+function catalogProviderId(catalog, name, baseUrl, alias) {
+  // alias: id do provedor no models.dev a usar quando o endpoint não está lá (ex: "openai")
+  if (alias && catalog[alias]) return alias;
   if (name && catalog[name]) return name;
   const host = hostOf(baseUrl);
   if (!host) return null;
@@ -62,8 +64,8 @@ function catalogProviderId(catalog, name, baseUrl) {
 }
 
 /** Metadados do modelo no catálogo, só dentro do mesmo provedor (sem chutar outro) */
-export function catalogModel(catalog, name, baseUrl, id) {
-  const pid = catalogProviderId(catalog, name, baseUrl);
+export function catalogModel(catalog, name, baseUrl, id, alias) {
+  const pid = catalogProviderId(catalog, name, baseUrl, alias);
   if (!pid) return null;
   const m = catalog[pid].models?.[id];
   return m || null;
@@ -87,11 +89,15 @@ export function entryOf(p, id) {
 /** Campos efetivos de um modelo, com a origem de cada um */
 export function effectiveMeta(p, id, name, catalog) {
   const e = entryOf(p, id) || {};
-  const cat = catalogModel(catalog, name, p.baseUrl, id);
+  const cat = catalogModel(catalog, name, p.baseUrl, id, p.catalog);
   const cv = cat ? fromCatalog(cat) : {};
   const src = e._src || {};
 
+  const forced = forcedFor(p);
   const pick = (k) => {
+    // limites fixos do arena (1M contexto, 131k saída, visão) sobrepõem o endpoint e o models.dev,
+    // mas um valor digitado pelo usuário (manual) continua ganhando
+    if (forced && forced[k] !== undefined && src[k] !== 'manual') return { v: forced[k], s: 'arena' };
     if (e[k] !== undefined) return { v: e[k], s: src[k] || 'manual' };
     if (cv[k] !== undefined) return { v: cv[k], s: 'models.dev' };
     return { v: PI_DEFAULTS[k], s: 'padrão' };
@@ -115,7 +121,7 @@ export function effectiveMeta(p, id, name, catalog) {
 
 /** Preenche campos ausentes do modelo com o catálogo, marcando a origem */
 export function fillFromCatalog(entry, p, name, catalog) {
-  const cat = catalogModel(catalog, name, p.baseUrl, entry.id);
+  const cat = catalogModel(catalog, name, p.baseUrl, entry.id, p.catalog);
   if (!cat) return;
   const cv = fromCatalog(cat);
   entry._src ??= {};
@@ -125,6 +131,11 @@ export function fillFromCatalog(entry, p, name, catalog) {
       entry._src[k] = 'models.dev';
     }
   }
+}
+
+/** Diz se o provedor tem alguma fonte de metadados (models.dev ou o próprio endpoint) */
+export function hasCatalogFor(catalog, name, baseUrl, alias) {
+  return !!catalogProviderId(catalog, name, baseUrl, alias);
 }
 
 /** Reduz o nível de thinking ao teto do modelo */
@@ -149,4 +160,24 @@ export function parseTokens(s) {
   if (!m) return NaN;
   const mult = m[2] === 'm' ? 1_000_000 : m[2] === 'k' ? 1000 : 1;
   return Math.round(Number(m[1]) * mult);
+}
+
+export const ARENA_HOST = 'api.arena.ai';
+export const ARENA_FORCED = { contextWindow: 1_000_000, maxTokens: 131_000, input: ['text', 'image'] };
+
+/** Limites fixos para o provedor arena, ou null para os demais */
+export function forcedFor(p) {
+  return hostOf(p?.baseUrl) === ARENA_HOST ? ARENA_FORCED : null;
+}
+
+/** Grava os limites fixos no modelo (usado ao sincronizar, para o models.json ficar certo) */
+export function applyForced(entry, p) {
+  const f = forcedFor(p);
+  if (!f) return;
+  entry._src ??= {};
+  for (const k of Object.keys(f)) {
+    if (entry._src[k] === 'manual') continue;
+    entry[k] = Array.isArray(f[k]) ? [...f[k]] : f[k];
+    entry._src[k] = 'arena';
+  }
 }

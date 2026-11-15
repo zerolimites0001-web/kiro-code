@@ -116,13 +116,3 @@ src/providers.js   streaming OpenAI-compatível e Anthropic
 src/tools.js       bash, read_file, write_file, edit_file, loop
 src/store.js       config, sessões e system prompt
 ```
-
-## Google (Gemini) — provedor nativo
-
-Use `/login` e escolha **Google (Gemini)**, depois cole a API key do Google AI Studio.
-O provedor usa a API nativa do Gemini (`generativelanguage.googleapis.com/v1beta`), não o endpoint compatível com OpenAI.
-
-- Contexto e saída máxima vêm de `inputTokenLimit` / `outputTokenLimit` da API; visão não é exposta pela API e é completada pelo models.dev.
-- Thinking: Gemini 3 usa `thinkingLevel` (minimal → xhigh mapeia para high); Gemini 2.5 usa `thinkingBudget`. `/thinking off` deixa o padrão do modelo.
-- Tokens de thinking (`thoughtsTokenCount`) entram no contador de saída, como no Anthropic.
-- A `thoughtSignature` das tool calls é guardada no histórico e devolvida ao modelo (exigido pelo Gemini 3).

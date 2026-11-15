@@ -52,6 +52,13 @@ function killTree(child, signal = 'SIGTERM') {
   }
 }
 
+const activeChildren = new Set();
+/** Mata todo processo de shell em andamento (usado na interrupção forçada) */
+export function killActive() {
+  for (const c of activeChildren) killTree(c, 'SIGKILL');
+  activeChildren.clear();
+}
+
 function runShell(command, { timeout = 60000, signal, log } = {}) {
   return new Promise((resolve) => {
     const child = spawn('sh', ['-c', command], {
@@ -59,6 +66,8 @@ function runShell(command, { timeout = 60000, signal, log } = {}) {
       env: process.env,
       detached: true, // process group próprio -> dá pra matar a árvore toda
     });
+    activeChildren.add(child);
+    child.on('close', () => activeChildren.delete(child));
     let out = '';
     let aborted = false;
     let done = false;
@@ -73,6 +82,9 @@ function runShell(command, { timeout = 60000, signal, log } = {}) {
     const onAbort = () => {
       aborted = true;
       killTree(child, 'SIGTERM');
+      // não espera o processo morrer: se ele ignorar SIGTERM, mata na marra
+      setTimeout(() => killTree(child, 'SIGKILL'), 800).unref?.();
+      finish({ aborted });
     };
 
     // Streaming ao vivo: cada pedaço de stdout/stderr vai para o log da TUI
