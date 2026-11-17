@@ -108,11 +108,21 @@ function hashOf(files) {
 
 /* ---------------- API entregue a cada plugin ---------------- */
 
+// Timer registrado por um plugin (auto-limpo no teardown)
+function registerTimer(rec, id, on) {
+  rec.timers.add(id);
+  return () => { clearInterval(id); clearTimeout(id); rec.timers.delete(id); };
+}
+
 function makeApi(rec) {
   const state = readState();
   const dataDir = path.join(DATA_DIR, rec.name);
   fs.mkdirSync(dataDir, { recursive: true });
   rec.offs = [];
+  if (!rec.timers) rec.timers = new Set();
+
+  // config efetiva (manifest defaults + estado salvo). `set` persiste no plugs.json
+  const effectiveConfig = { ...(rec.manifest?.config || {}), ...(state.config[rec.name] || {}) };
 
   return {
     /** Ferramenta para o agente: o nome final é plug__<plugin>__<nome> */
@@ -122,32 +132,78 @@ function makeApi(rec) {
       rec.tools.add(name);
     },
 
-    /** Comando /nome. run(args) recebe o texto depois do comando */
+    /** Comando /nome. run(args, ctx) recebe o texto depois do comando + contexto */
     command(name, def) {
       const cmd = name.startsWith('/') ? name : `/${name}`;
-      commands.set(cmd, { owner: rec.name, description: def.description || '', run: def.run });
+      commands.set(cmd, {
+        owner: rec.name,
+        description: def.description || '',
+        run: def.run,
+      });
       rec.commands.add(cmd);
     },
 
-    /** Área ao vivo na TUI. render() devolve linhas e a TUI redesenha a cada segundo */
+    /** Área ao vivo na TUI. render() devolve linhas; `interval` ms (>=250) opcional */
     widget(id, def) {
       const key = `${rec.name}:${id}`;
       rec.widgets.add(key);
-      host?.tui.setWidget(key, { render: def.render });
+      host?.tui.setWidget(key, {
+        render: def.render,
+        interval: Number.isFinite(def.interval) ? Math.max(250, def.interval) : undefined,
+      });
     },
 
-    print: (text, color) => host?.tui.print(text, color),
+    /** Escreve no histórico da TUI. `color` aceita um código ANSI ou nome */
+    print: (text, color) => host?.tui.print(text, color || ''),
 
+    /** Assina um evento. A assinatura é removida pelo loader no cleanup */
     on(evt, fn) {
       rec.offs.push(on(evt, fn));
     },
 
+    /** Emite um evento para os plugins carregados */
     emit: (evt, data) => emit(evt, data),
 
-    config: { ...(rec.manifest?.config || {}), ...(state.config[rec.name] || {}) },
+    /** Timer seguro: auto-limpo no teardown/reload */
+    interval(fn, ms) {
+      const id = setInterval(() => { try { fn(); } catch (e) { logDebug(`[plugin ${rec.name}] interval: ${e.message}`); } }, Math.max(16, ms));
+      return registerTimer(rec, id, true);
+    },
+    timeout(fn, ms) {
+      const id = setTimeout(() => { try { fn(); } catch (e) { logDebug(`[plugin ${rec.name}] timeout: ${e.message}`); } }, Math.max(0, ms));
+      return registerTimer(rec, id, false);
+    },
 
+    /** Configuração efetiva do plugin (readonly-ish). Use configSet para gravar */
+    get config() { return { ...effectiveConfig }; },
+    /** Grava uma chave de configuração do plugin (persistente em plugins.json) */
+    configSet(key, value) {
+      const s = readState();
+      s.config[rec.name] = { ...(s.config[rec.name] || {}), [key]: value };
+      writeState(s);
+      effectiveConfig[key] = value;
+    },
+
+    /** Diretório de dados persistente do plugin no HOME lógico */
     dataDir,
 
+    /** Roteador HTTP leve? Não — utilitários de dados: */
+    data: {
+      read(name, fallback = null) {
+        try { return JSON.parse(fs.readFileSync(path.join(dataDir, name), 'utf8')); }
+        catch { return fallback; }
+      },
+      write(name, value) {
+        fs.mkdirSync(dataDir, { recursive: true });
+        fs.writeFileSync(path.join(dataDir, name), JSON.stringify(value, null, 2));
+      },
+      file(name) { return path.join(dataDir, name); },
+    },
+
+    /** Lista de plugins carregados: [{name, version, status}] */
+    plugins: () => [...plugins.values()].map((p) => ({ name: p.name, version: p.version, status: p.status })),
+
+    /** Log de depuração no debug.log local */
     log: (msg) => logDebug(`[plugin ${rec.name}] ${msg}`),
   };
 }
@@ -162,6 +218,9 @@ function cleanup(rec) {
   rec.widgets.clear();
   for (const off of rec.offs || []) off();
   rec.offs = [];
+  // limpa timers registrados via kiro.interval/timeout
+  for (const t of rec.timers || []) { clearInterval(t); clearTimeout(t); }
+  rec.timers?.clear();
   rec.tools.clear();
 }
 
@@ -220,6 +279,7 @@ export async function loadPlugins() {
       commands: new Set(),
       tools: new Set(),
       widgets: new Set(),
+      timers: new Set(),
       offs: [],
     };
     plugins.set(d.name, rec);

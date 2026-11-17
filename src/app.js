@@ -900,8 +900,16 @@ async function handleCommand(line) {
   const pluginCmd = getPluginCommand(cmd);
   if (pluginCmd) {
     try {
-      const r = await pluginCmd.run(rest);
+      const ctx = { cmd, args: rest, owner: pluginCmd.owner, tui };
+      const r = await pluginCmd.run(rest, ctx);
       if (typeof r === 'string') tui.print(r);
+      else if (Array.isArray(r)) {
+        // aceita linhas [texto, cor] ou strings soltas
+        for (const item of r) {
+          if (Array.isArray(item)) tui.print(item[0], item[1] || '');
+          else tui.print(String(item));
+        }
+      }
     } catch (err) {
       tui.print(`Erro no plugin (${pluginCmd.owner}): ${err.message}`, FG.err);
     }

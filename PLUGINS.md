@@ -145,17 +145,34 @@ O caminho de saída normal do aplicativo não faz uma rodada explícita de
 | --- | --- |
 | `kiro.tool({schema, run})` | Registra ferramenta com nome `plug__<plugin>__<nome>` |
 | `kiro.command(nome, {description, run})` | Registra comando slash; adiciona `/` se faltar |
-| `kiro.widget(id, {render})` | Registra widget na faixa da TUI |
+| `kiro.widget(id, {render, interval?})` | Registra widget na faixa da TUI; `interval` (ms ≥ 250) controla o redesenho |
 | `kiro.print(texto, cor?)` | Escreve no histórico da interface |
 | `kiro.on(evento, fn)` | Assina evento; a assinatura é removida pelo loader na limpeza |
 | `kiro.emit(evento, dados)` | Emite evento para os plugins carregados |
-| `kiro.config` | Configuração efetiva do próprio plugin |
+| `kiro.interval(fn, ms)` | `setInterval` seguro, **auto-limpado** no teardown/reload; devolve `cancel()` |
+| `kiro.timeout(fn, ms)` | `setTimeout` seguro, **auto-limpado** no teardown/reload; devolve `cancel()` |
+| `kiro.config` | Configuração efetiva do próprio plugin (defaults + salvo) |
+| `kiro.configSet(chave, valor)` | Grava e persiste uma chave de config em `plugins.json` |
+| `kiro.data.read(nome, fallback?)` | Lê JSON do `dataDir` do plugin |
+| `kiro.data.write(nome, valor)` | Grava JSON no `dataDir` do plugin |
+| `kiro.data.file(nome)` | Caminho absoluto de um arquivo no `dataDir` |
+| `kiro.plugins()` | Lista `[{name, version, status}]` dos plugins carregados |
 | `kiro.dataDir` | Diretório de dados do plugin no HOME lógico |
 | `kiro.log(mensagem)` | Registra uma mensagem no debug.log local |
 
-`command.run(args)` recebe o texto depois do comando, não um objeto de contexto
-adicional. Retornar uma string faz o comando imprimi-la. Evite nomes que colidam
-com comandos internos ou de outros plugins: não há isolamento robusto de colisões.
+`command.run(args, ctx)` recebe o texto depois do comando e um **contexto**
+`ctx = {cmd, args, owner, tui}`. O retorno pode ser:
+- uma **string** → impressa no histórico;
+- um **array de linhas** → cada item pode ser `"texto"` ou `[texto, cor]`.
+
+Evite nomes que colidam com comandos internos ou de outros plugins: não há
+isolamento robusto de colisões.
+
+> **Timers:** `kiro.interval` e `kiro.timeout` são registrados e cancelados
+> automaticamente na limpeza (desativar, reload). Prefira-os a `setInterval`
+> global para não vazar recursos. Recursos criados diretamente (subprocessos,
+> fontes de dados) continuam exigindo limpeza própria no `teardown`.
+
 
 ### Ferramentas
 
@@ -204,15 +221,45 @@ Eventos não são hooks canceláveis e não fornecem aprovação/bloqueio de fer
 ```js
 kiro.widget('relogio', {
   render: () => [`Hora: ${new Date().toLocaleTimeString()}`],
+  interval: 1000, // opcional: redesenho próprio (ms, mínimo 250)
 });
 ```
 
 - `render()` retorna um array de linhas.
-- A TUI redesenha aproximadamente a cada **1 segundo** enquanto houver widgets.
-- Um campo `interval` individual **não é usado** pelo loader atual.
+- `interval` individual (ms, mínimo 250) define a cadência de redesenho do widget;
+  sem ele, o widget é redesenhado a cada ~1 segundo.
 - A faixa limita a saída a seis linhas no total, com indicação de excesso.
 - Linhas vazias não ocupam a faixa; erros de render são ignorados no desenho,
   não convertem automaticamente o status do plugin em `erro`.
+
+### Exemplo completo (timers, config e dados)
+
+```js
+export default {
+  name: 'contador',
+  version: '1.0.0',
+  setup(kiro) {
+    // contador persistente no dataDir
+    const state = kiro.data.read('estado.json', { n: 0 });
+    const meta = kiro.config.meta ?? 10;
+    const cancel = kiro.interval(() => { state.n++; }, 1000); // auto-limpo no teardown
+
+    kiro.widget('contador', {
+      interval: 500,
+      render: () => [`🔢 ${state.n} / meta ${meta}`],
+    });
+
+    kiro.command('/contador', {
+      run(args, ctx) {
+        if (args === 'salvar') { kiro.data.write('estado.json', state); return 'salvo'; }
+        kiro.emit('plugin:contador:changed', { n: state.n });
+        return [['Contador: ' + state.n, '\x1b[38;5;114m'], 'meta: ' + meta];
+      },
+    });
+  },
+  teardown() { /* timers via kiro.interval já são limpos; aqui só o que você criou */ },
+};
+```
 
 ## Aprovação, configuração e recarregamento
 

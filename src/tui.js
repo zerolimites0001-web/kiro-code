@@ -549,9 +549,20 @@ export class TUI {
   /* ---------- widgets ao vivo (plugins) ---------- */
 
   setWidget(key, def) {
-    this.widgets.set(key, def);
-    if (!this.wtimer) this.wtimer = setInterval(() => this.draw(), 1000);
+    this.widgets.set(key, { ...def, _next: 0 });
+    if (!this.wtimer) this.wtimer = setInterval(() => this._tickWidgets(), 250);
     this.draw();
+  }
+
+  // redesenha respeitando o `interval` individual de cada widget (>=250ms)
+  _tickWidgets() {
+    const now = Date.now();
+    let due = false;
+    for (const def of this.widgets.values()) {
+      const iv = def.interval || 1000;
+      if (now >= (def._next || 0)) { def._next = now + iv; due = true; }
+    }
+    if (due) this.draw();
   }
 
   removeWidgets(prefix) {
@@ -1017,7 +1028,67 @@ export class TUI {
     return lines;
   }
 
-    /** Renderiza a linha de input com cursor visível, respeitando a largura disponível */
+    /**
+   * Input que quebra em linhas (como o Claude Code): texto longo desce para a linha de baixo
+   * em vez de rolar para o lado. Mostra até 6 linhas, mantendo o cursor visível.
+   */
+  wrapInput(prompt, cols) {
+    const MAXROWS = 6;
+    // prompt já inclui o espaço final; mede por grafemas (o ❯ ocupa 1 coluna no terminal)
+    const pw = [...graphemes(vis(prompt))].length;
+    const avail = Math.max(4, cols - pw - 1);
+    const segs = [...graphemes(this.input)].map((x) => (/[\x00-\x1f\x7f]/.test(x.segment) ? ' ' : x.segment));
+    const widths = segs.map((s) => graphemeW(s));
+    const cur = Math.max(0, Math.min(this.cursor, segs.length));
+
+    // divide em linhas (por largura visual, sem partir grapheme)
+    const rows = [];
+    let from = 0;
+    let w = 0;
+    for (let i = 0; i < segs.length; i++) {
+      if (w + widths[i] > avail && w > 0) {
+        rows.push({ from, to: i });
+        from = i;
+        w = 0;
+      }
+      w += widths[i];
+    }
+    rows.push({ from, to: segs.length });
+
+    let cRow = rows.findIndex((r) => cur >= r.from && cur < r.to);
+    if (cRow < 0) cRow = rows.length - 1;
+    const rowStart = rows[cRow].from;
+    let cW = 0;
+    for (let i = rowStart; i < cur; i++) cW += widths[i];
+
+    // janela vertical: mantém a linha do cursor à vista
+    const start = Math.max(0, Math.min(rows.length - MAXROWS, cRow - MAXROWS + 1));
+    const shown = rows.slice(start, start + MAXROWS);
+
+    const lines = shown.map((r, k) => {
+      const idx = start + k;
+      const lead = idx === 0 ? prompt : ' '.repeat(pw);
+      let text;
+      let rowW = 0;
+      for (let i = r.from; i < r.to; i++) rowW += widths[i];
+      if (idx === cRow) {
+        const before = segs.slice(r.from, cur).join('');
+        const ch = segs[cur] || ' ';
+        const after = segs.slice(cur + 1, r.to).join('');
+        const chW = cur < segs.length ? widths[cur] : 1;
+        text = before + '\x1b[7m' + ch + R + '\x1b[27m' + after;
+        rowW += cur < segs.length ? 0 : 1;
+        void chW;
+      } else {
+        text = segs.slice(r.from, r.to).join('');
+      }
+      return lead + text + ' '.repeat(Math.max(0, avail - rowW)) + R;
+    });
+
+    return { lines, cursorRow: cRow - start, cursorCol: pw + cW + 1 };
+  }
+
+  /** Renderiza a linha de input com cursor visível, respeitando a largura disponível */
   renderInput(prompt, room) {
     const visPrompt = vis(prompt);
     const promptW = dwidth(visPrompt);
@@ -1103,7 +1174,10 @@ export class TUI {
       const secs = Math.floor((Date.now() - (this.busyStart || Date.now())) / 1000);
       dock.push(`${FG.warn}${frame} Working${dots} ${FG.dim}· ${this.busyLabel} · ${secs}s · ESC para interromper${R}`);
     }
-    const bodyH = Math.max(3, rows - 4 - dock.length);
+    const prompt = this.asker ? `${FG.warn}${this.asker.prompt}${R} ` : `${C.green}${C.b}❯${R} `;
+    const inp = this.wrapInput(prompt, cols);
+    this._cursorCol = inp.cursorCol;
+    const bodyH = Math.max(3, rows - 3 - dock.length - inp.lines.length);
     let owners = [];
     let all = this.renderAll(cols, owners);
     // chegou perto do topo da janela visual: carrega mais 50 entradas para cima
@@ -1133,20 +1207,18 @@ export class TUI {
     const header = pad(left, cols);
 
     const sep = `${FG.dim}${'─'.repeat(cols)}${R}`;
-    const prompt = this.asker ? `${FG.warn}${this.asker.prompt}${R} ` : `${C.green}${C.b}❯${R} `;
-    const room = Math.max(1, cols - dwidth(vis(prompt)) - 1);
-    const input = this.renderInput(prompt, room);
     const scrollNote = this.scroll > 0 ? `  ↑ ${this.scroll} acima` : '';
     const foot = `${FG.dim}${this.footer}${scrollNote}${R}`;
 
     // Nada de '\n' entre as linhas: um '\n' depois de uma linha exatamente da largura da tela
     // dispara o wrap pendente do terminal e rola a tela (metade da TUI sumia no /resume).
     // Cada linha vai para sua posição absoluta com CUP.
-    const rowsToDraw = [header, ...body, ...dock, sep, input, foot].slice(0, rows);
+    const rowsToDraw = [header, ...body, ...dock, sep, ...inp.lines, foot].slice(0, rows);
     const next = [];
     for (let i = 0; i < rows; i++) next.push(i < rowsToDraw.length ? pad(rowsToDraw[i], cols) + R : '');
     // guarda a linha física da input para posicionar o cursor real do terminal
-    this._inputRow = rowsToDraw.length - 2; // input está antes do foot
+    // linha física (0-based) da primeira linha do input, + linha do cursor dentro dele
+    this._inputRow = 1 + body.length + dock.length + 1 + inp.cursorRow;
     this.paintDiff(next, cols, rows);
   }
 
