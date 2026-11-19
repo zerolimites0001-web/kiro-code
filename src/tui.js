@@ -1,3 +1,4 @@
+import { TerminalInput } from './terminal-input.js';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -387,6 +388,18 @@ export class TUI {
     this.widgets = new Map();
     this.wtimer = null;
     this.onCycleThinking = () => {};
+    this.terminalInput = new TerminalInput({
+      onKeys: (data) => this._onKeyData(data),
+      onPaste: (text) => {
+        if (this.menu) {
+          for (const ch of text.replace(/[\r\n\t]/g, ' ')) this.menuKey(ch);
+          return;
+        }
+        this._flushPendingInput();
+        this._pendingInput = text;
+        this._flushPendingInput();
+      },
+    });
   }
 
   get cols() {
@@ -402,7 +415,7 @@ export class TUI {
 
   start() {
     // ?7l = sem quebra automática: linha maior que a tela corta à direita em vez de empurrar a tela
-    process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h');
+    process.stdout.write('\x1b[?2004h\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h');
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
@@ -416,9 +429,10 @@ export class TUI {
   }
 
   stop() {
+    clearTimeout(this._pasteEscapeTimer);
     clearInterval(this.timer);
     this._prevFrame = null;
-    process.stdout.write('\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l' + R);
+    process.stdout.write('\x1b[?2004l\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l' + R);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
   }
 
@@ -614,6 +628,17 @@ export class TUI {
   /* ---------- entrada ---------- */
 
   onData(data) {
+    clearTimeout(this._pasteEscapeTimer);
+    this.terminalInput.feed(data);
+    // ESC isolado continua cancelando; delimitadores de paste podem vir partidos.
+    this._pasteEscapeTimer = setTimeout(() => {
+      this.terminalInput.flushEscape();
+      this.draw();
+    }, 40);
+    this.draw();
+  }
+
+  _onKeyData(data) {
     const mouse = data.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g);
     if (mouse) {
       for (const raw of mouse) {
