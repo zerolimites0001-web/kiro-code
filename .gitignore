@@ -10,3 +10,37 @@ coverage/
 
 # Contexto local entre chats: nunca versionar
 SYSTEM.md
+
+# ===== credenciais locais (nunca versionar) =====
+.tokens
+.tokens.*
+*.tokens
+config.json
+!examples/**/config.json
+credentials.json
+secrets.json
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+.npmrc
+.netrc
+.aws/
+.ssh/
+
+# sessões / histórico do agente
+.kiro-sessions/
+sessions/
+*.session.json
+history/
+memory.json
+*.memory.json
+
+# caches e artefatos
+dist/
+build/
+.cache/
+*.zip
+nohup.out
+tmp/
